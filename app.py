@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
-    QPlainTextEdit,
     QPushButton,
     QStyle,
     QTabWidget,
@@ -22,6 +21,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QAbstractItemView,
+    QCheckBox,
+    QProgressBar,
 )
 
 import yt_dlp
@@ -83,66 +84,90 @@ class YTDLPProbeWorker(QThread):
 
 
 class YTDLPDownloadWorker(QThread):
-    """Worker chargé du téléchargement d'un format spécifique."""
+    """Worker chargé du téléchargement séquentiel vidéo/audio."""
 
-    log: Signal = Signal(str)
     progress: Signal = Signal(int)
+    status: Signal = Signal(str)
     finished: Signal = Signal(bool, object, object)
 
-    def __init__(self, url: str, itag: str, download_dir: Path, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        itag: str,
+        download_dir: Path,
+        download_video: bool,
+        download_audio: bool,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self._url = url
         self._itag = itag
         self._download_dir = download_dir
-        self._final_path: Optional[Path] = None
+        self._download_video = download_video
+        self._download_audio = download_audio
 
-    def _progress_hook(self, data: Dict[str, Any]) -> None:
-        status = data.get("status")
-        if status == "downloading":
-            total = data.get("total_bytes") or data.get("total_bytes_estimate")
-            downloaded = data.get("downloaded_bytes")
-            if total and downloaded:
-                percent = int(downloaded * 100 / total)
-                self.progress.emit(percent)
-            speed = data.get("_speed_str")
-            eta = data.get("_eta_str")
-            text = "Téléchargement en cours"
-            if speed:
-                text += f" - vitesse {speed}"
-            if eta:
-                text += f" - reste {eta}"
-            self.log.emit(text)
-        elif status == "finished":
-            filename = data.get("filename")
-            if filename:
-                path = Path(filename)
-                self._final_path = Path("./downloads") / path.name
-            self.log.emit("Traitement final…")
+    def _emit_progress(self, value: int) -> None:
+        self.progress.emit(max(0, min(100, value)))
 
     def run(self) -> None:
+        success = True
+        error_message: Optional[str] = None
         try:
-            self.log.emit("Préparation du téléchargement…")
-            ensure_download_dir(self._download_dir)
-            outtmpl = str(self._download_dir / "%(title)s.%(ext)s")
-            options = {
-                "quiet": True,
-                "format": self._itag,
-                "outtmpl": outtmpl,
-                "noplaylist": True,
-                "nocheckcertificate": True,
-                "progress_hooks": [self._progress_hook],
-            }
-            with yt_dlp.YoutubeDL(options) as ydl:
-                ydl.download([self._url])
-            final_path = self._final_path
-            if final_path is None:
-                final_path = Path(outtmpl.replace("%(title)s", "video").replace("%(ext)s", ""))
-            self.finished.emit(True, str(final_path), None)
-            self.log.emit("Téléchargement terminé.")
+            out_dir = ensure_download_dir(self._download_dir)
+
+            def hook(data: Dict[str, Any]) -> None:
+                if data.get("status") == "downloading":
+                    total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+                    done = data.get("downloaded_bytes", 0)
+                    pct = int(done * 100 / total) if total else 0
+                    self.progress.emit(pct)
+                elif data.get("status") == "finished":
+                    self.progress.emit(100)
+
+            if self._download_video:
+                self._emit_progress(0)
+                self.status.emit("Téléchargement vidéo…")
+                ydl_opts_mp4 = {
+                    "format": f"{self._itag}",
+                    "merge_output_format": "mp4",
+                    "outtmpl": str(out_dir / "%(title)s.%(ext)s"),
+                    "progress_hooks": [hook],
+                    "quiet": True,
+                    "no_warnings": True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts_mp4) as ydl:
+                    ydl.extract_info(self._url, download=True)
+                self.progress.emit(100)
+
+            if success and self._download_audio:
+                self._emit_progress(0)
+                self.status.emit("Extraction audio…")
+                ydl_opts_mp3 = {
+                    "format": "bestaudio/best",
+                    "outtmpl": str(out_dir / "%(title)s.%(ext)s"),
+                    "postprocessors": [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192",
+                        }
+                    ],
+                    "progress_hooks": [hook],
+                    "quiet": True,
+                    "no_warnings": True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts_mp3) as ydl:
+                    ydl.extract_info(self._url, download=True)
+                self.progress.emit(100)
+
         except Exception as exc:  # noqa: BLE001
-            message = f"Erreur de téléchargement : {exc}"
-            self.finished.emit(False, None, message)
-            self.log.emit(message)
+            success = False
+            error_message = f"Erreur : {exc}"
+            self.status.emit(error_message)
+
+        if success:
+            self.status.emit("Terminé")
+        self.finished.emit(success, None, error_message)
 
 
 class YouTubeTab(QWidget):
@@ -183,12 +208,30 @@ class YouTubeTab(QWidget):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.itemDoubleClicked.connect(self._on_table_double_clicked)
+        self.table.cellDoubleClicked.connect(self._on_row_double_clicked)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
 
-        self.console = QPlainTextEdit()
-        self.console.setReadOnly(True)
+        self.status_label = QLabel("Prêt.")
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(True)
+        self.progress.setStyleSheet(
+            "QProgressBar{ text-align:center; }"
+            "QProgressBar::chunk{ background:#28a745; }"
+        )
+
+        options_layout = QHBoxLayout()
+        self.download_video_checkbox = QCheckBox("MP4 (vidéo)")
+        self.download_video_checkbox.setChecked(True)
+        self.download_audio_checkbox = QCheckBox("MP3 (audio)")
+        self.download_audio_checkbox.setChecked(True)
+        self.download_video_checkbox.stateChanged.connect(self._update_download_button_state)
+        self.download_audio_checkbox.stateChanged.connect(self._update_download_button_state)
+        options_layout.addWidget(self.download_video_checkbox)
+        options_layout.addWidget(self.download_audio_checkbox)
+        options_layout.addStretch()
 
         self.download_button = QPushButton("Télécharger")
         self.download_button.setEnabled(False)
@@ -196,13 +239,14 @@ class YouTubeTab(QWidget):
 
         layout.addLayout(input_layout)
         layout.addWidget(self.table)
-        layout.addWidget(self.console)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.progress)
+        layout.addLayout(options_layout)
         layout.addWidget(self.download_button)
 
     def append_log(self, message: str) -> None:
-        """Append a message to the console."""
-        self.console.appendPlainText(message)
-        self.console.verticalScrollBar().setValue(self.console.verticalScrollBar().maximum())
+        """Met à jour le label de statut."""
+        self.status_label.setText(message)
 
     def _on_analyze_clicked(self) -> None:
         url = self.url_input.text().strip()
@@ -216,6 +260,7 @@ class YouTubeTab(QWidget):
         self.table.setRowCount(0)
         self.formats_data.clear()
         self.current_url = url
+        self.progress.setValue(0)
         self.probe_worker = YTDLPProbeWorker(url)
         self.probe_worker.log.connect(self.append_log)
         self.probe_worker.error.connect(self.append_log)
@@ -228,9 +273,18 @@ class YouTubeTab(QWidget):
         self.probe_worker = None
 
     def _populate_formats(self, formats: List[Dict[str, Any]]) -> None:
-        self.formats_data = formats
-        self.table.setRowCount(len(formats))
-        for row, data in enumerate(formats):
+        rows = [
+            f
+            for f in formats
+            if f.get("ext") == "mp4"
+            and not str(f.get("format_id", "")).startswith("sb")
+            and f.get("ext") != "mhtml"
+            and f.get("vcodec") not in (None, "none")
+            and f.get("acodec") not in (None, "none")
+        ]
+        self.formats_data = rows
+        self.table.setRowCount(len(rows))
+        for row, data in enumerate(rows):
             fields = {
                 "itag": str(data.get("format_id", "")),
                 "ext": data.get("ext", ""),
@@ -252,20 +306,23 @@ class YouTubeTab(QWidget):
         self.table.resizeColumnsToContents()
         if self.table.columnCount() > 0:
             self.table.setColumnWidth(0, 30)
-        self.append_log("Double-cliquez sur un format pour le sélectionner.")
+        if rows:
+            self.append_log("Double-cliquez sur un format pour le sélectionner.")
+        else:
+            self.append_log("Aucun format MP4 progressif trouvé.")
 
-    def _on_table_double_clicked(self, item: QTableWidgetItem) -> None:
-        row = item.row()
+    def _on_row_double_clicked(self, row: int, column: int) -> None:  # noqa: ARG002
         if row < 0 or row >= len(self.formats_data):
             return
         format_id = self.formats_data[row].get("format_id")
         if not format_id:
             self.append_log("Format invalide sélectionné.")
             return
+        self.table.selectRow(row)
         self.selected_itag = str(format_id)
         self._update_checkmarks(row)
         self.append_log(f"Format sélectionné : itag {self.selected_itag}.")
-        self.download_button.setEnabled(True)
+        self._update_download_button_state()
 
     def _update_checkmarks(self, selected_row: int) -> None:
         check_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
@@ -280,43 +337,59 @@ class YouTubeTab(QWidget):
 
     def _reset_selection(self) -> None:
         self.selected_itag = None
+        self.table.clearSelection()
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
             if item:
                 item.setData(Qt.ItemDataRole.DecorationRole, QIcon())
+        self._update_download_button_state()
+
+    def _update_download_button_state(self) -> None:
+        any_download = self.download_video_checkbox.isChecked() or self.download_audio_checkbox.isChecked()
+        self.download_button.setEnabled(bool(self.selected_itag) and any_download and not self._is_download_running())
+
+    def _is_download_running(self) -> bool:
+        return self.download_worker is not None and self.download_worker.isRunning()
 
     def _on_download_clicked(self) -> None:
         if not self.current_url or not self.selected_itag:
             self.append_log("Sélectionnez un format avant de télécharger.")
             return
-        if self.download_worker is not None and self.download_worker.isRunning():
+        if not (self.download_video_checkbox.isChecked() or self.download_audio_checkbox.isChecked()):
+            self.append_log("Sélectionnez au moins un type de téléchargement.")
+            return
+        if self._is_download_running():
             self.append_log("Téléchargement déjà en cours.")
             return
         download_dir = ensure_download_dir(Path("./downloads"))
         self.download_button.setEnabled(False)
-        self.append_log("Début du téléchargement…")
-        self.download_worker = YTDLPDownloadWorker(self.current_url, self.selected_itag, download_dir)
-        self.download_worker.log.connect(self.append_log)
+        self.append_log("Préparation du téléchargement…")
+        self.progress.setValue(0)
+        self.download_worker = YTDLPDownloadWorker(
+            self.current_url,
+            self.selected_itag,
+            download_dir,
+            self.download_video_checkbox.isChecked(),
+            self.download_audio_checkbox.isChecked(),
+        )
         self.download_worker.progress.connect(self._on_download_progress)
+        self.download_worker.status.connect(self.append_log)
         self.download_worker.finished.connect(self._on_download_finished)
         self.download_worker.start()
 
     def _on_download_progress(self, percent: int) -> None:
-        self.append_log(f"Progression : {percent}%")
+        self.progress.setValue(percent)
 
     def _on_download_finished(self, success: bool, path: Optional[str], error: Optional[str]) -> None:
-        if success:
-            if path:
-                self.append_log(f"Téléchargement terminé : {path}")
-            else:
-                self.append_log("Téléchargement terminé.")
-        else:
+        if not success:
             if error:
                 self.append_log(error)
             else:
                 self.append_log("Téléchargement échoué.")
-        self.download_button.setEnabled(bool(self.selected_itag))
+        self.progress.setValue(100 if success else self.progress.value())
+        self.download_button.setEnabled(False)
         self.download_worker = None
+        self._update_download_button_state()
 
 
 class MainWindow(QMainWindow):
