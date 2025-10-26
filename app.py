@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import sys
+from os import stat
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QThread, Qt, Signal
-from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -14,43 +14,74 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QPushButton,
-    QStyle,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
     QAbstractItemView,
-    QCheckBox,
     QProgressBar,
 )
 
 import yt_dlp
 
 
-def ensure_download_dir(path: Path) -> Path:
-    """Ensure the download directory exists."""
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+BASE_DIR = Path(r"C:\Users\Lamine\Desktop\alpha\downloads")
+VIDEOS_DIR = BASE_DIR / "videos"
+AUDIOS_DIR = BASE_DIR / "audios"
+VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+AUDIOS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def format_filesize(value: Optional[int]) -> str:
-    """Return a human-readable representation of the filesize."""
-    if not value or value <= 0:
+def _estimate_size_bytes(fmt: Dict[str, Any], duration: Optional[float]) -> Tuple[Optional[int], bool]:
+    """Retourne (bytes, is_approx) en se basant sur les informations disponibles."""
+    filesize = fmt.get("filesize")
+    if isinstance(filesize, (int, float)) and filesize > 0:
+        return int(filesize), False
+    filesize_approx = fmt.get("filesize_approx")
+    if isinstance(filesize_approx, (int, float)) and filesize_approx > 0:
+        return int(filesize_approx), True
+    tbr = fmt.get("tbr")
+    if not tbr:
+        vbr, abr = fmt.get("vbr"), fmt.get("abr")
+        if vbr and abr:
+            tbr = float(vbr) + float(abr)
+    if duration and tbr:
+        estimate = int((float(tbr) * 1000.0 / 8.0) * float(duration))
+        return estimate, True
+    return None, True
+
+
+def _human_mb(nbytes: Optional[int], approx: bool) -> str:
+    if not nbytes or nbytes <= 0:
         return "?"
-    units = ["o", "Ko", "Mo", "Go", "To"]
-    size = float(value)
-    unit_index = 0
-    while size >= 1024 and unit_index < len(units) - 1:
-        size /= 1024
-        unit_index += 1
-    return f"{size:.1f} {units[unit_index]}"
+    value = nbytes / (1024 * 1024)
+    text = f"{value:.1f} Mo"
+    return f"~{text}" if approx else text
+
+
+def _fmt_duration(seconds: Optional[int]) -> str:
+    if not seconds:
+        return "Durée : ?"
+    minutes, sec = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"Durée : {hours:d}:{minutes:02d}:{sec:02d}"
+    return f"Durée : {minutes:d}:{sec:02d}"
+
+
+def _human_mb_exact(path: Path) -> Tuple[str, Optional[int]]:
+    try:
+        size = stat(path).st_size
+    except OSError:
+        return "?", None
+    return f"{size / (1024 * 1024):.1f} Mo", size
 
 
 class YTDLPProbeWorker(QThread):
     """Worker chargé d'analyser une URL YouTube."""
 
-    formats_ready: Signal = Signal(list)
+    info_ready: Signal = Signal(dict)
     log: Signal = Signal(str)
     error: Signal = Signal(str)
     finished: Signal = Signal()
@@ -72,9 +103,12 @@ class YTDLPProbeWorker(QThread):
             }
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(self._url, download=False)
-            formats: List[Dict[str, Any]] = info.get("formats", []) if isinstance(info, dict) else []
-            self.formats_ready.emit(formats)
-            self.log.emit(f"Formats trouvés : {len(formats)}")
+            if isinstance(info, dict):
+                formats = info.get("formats", []) or []
+                self.log.emit(f"Formats trouvés : {len(formats)}")
+                self.info_ready.emit(info)
+            else:
+                self.error.emit("Réponse inattendue d'yt-dlp.")
         except Exception as exc:  # noqa: BLE001
             message = f"Erreur pendant l'analyse : {exc}"
             self.error.emit(message)
@@ -88,23 +122,17 @@ class YTDLPDownloadWorker(QThread):
 
     progress: Signal = Signal(int)
     status: Signal = Signal(str)
-    finished: Signal = Signal(bool, object, object)
+    finished: Signal = Signal(bool, object, object, object)
 
     def __init__(
         self,
         url: str,
         itag: str,
-        download_dir: Path,
-        download_video: bool,
-        download_audio: bool,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self._url = url
         self._itag = itag
-        self._download_dir = download_dir
-        self._download_video = download_video
-        self._download_audio = download_audio
 
     def _emit_progress(self, value: int) -> None:
         self.progress.emit(max(0, min(100, value)))
@@ -112,62 +140,72 @@ class YTDLPDownloadWorker(QThread):
     def run(self) -> None:
         success = True
         error_message: Optional[str] = None
+        video_path: Optional[str] = None
+        audio_path: Optional[str] = None
+
+        def hook(data: Dict[str, Any]) -> None:
+            nonlocal video_path, audio_path
+            status = data.get("status")
+            if status == "downloading":
+                total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+                done = data.get("downloaded_bytes", 0)
+                pct = int(done * 100 / total) if total else 0
+                self.progress.emit(pct)
+            elif status == "finished":
+                filename = data.get("filename")
+                if filename and filename.endswith(".mp3"):
+                    audio_path = filename
+                else:
+                    video_path = filename or video_path
+                self.progress.emit(100)
+
         try:
-            out_dir = ensure_download_dir(self._download_dir)
+            # Étape 1 : vidéo MP4
+            self._emit_progress(0)
+            self.status.emit("Téléchargement vidéo (1/2)…")
+            ydl_opts_mp4 = {
+                "format": f"{self._itag}",
+                "merge_output_format": "mp4",
+                "outtmpl": str(VIDEOS_DIR / "%(title)s.%(ext)s"),
+                "progress_hooks": [hook],
+                "quiet": True,
+                "no_warnings": True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts_mp4) as ydl:
+                ydl.download([self._url])
 
-            def hook(data: Dict[str, Any]) -> None:
-                if data.get("status") == "downloading":
-                    total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
-                    done = data.get("downloaded_bytes", 0)
-                    pct = int(done * 100 / total) if total else 0
-                    self.progress.emit(pct)
-                elif data.get("status") == "finished":
-                    self.progress.emit(100)
-
-            if self._download_video:
-                self._emit_progress(0)
-                self.status.emit("Téléchargement vidéo…")
-                ydl_opts_mp4 = {
-                    "format": f"{self._itag}",
-                    "merge_output_format": "mp4",
-                    "outtmpl": str(out_dir / "%(title)s.%(ext)s"),
-                    "progress_hooks": [hook],
-                    "quiet": True,
-                    "no_warnings": True,
-                }
-                with yt_dlp.YoutubeDL(ydl_opts_mp4) as ydl:
-                    ydl.extract_info(self._url, download=True)
-                self.progress.emit(100)
-
-            if success and self._download_audio:
-                self._emit_progress(0)
-                self.status.emit("Extraction audio…")
-                ydl_opts_mp3 = {
-                    "format": "bestaudio/best",
-                    "outtmpl": str(out_dir / "%(title)s.%(ext)s"),
-                    "postprocessors": [
-                        {
-                            "key": "FFmpegExtractAudio",
-                            "preferredcodec": "mp3",
-                            "preferredquality": "192",
-                        }
-                    ],
-                    "progress_hooks": [hook],
-                    "quiet": True,
-                    "no_warnings": True,
-                }
+            # Étape 2 : audio MP3
+            self._emit_progress(0)
+            self.status.emit("Extraction audio (2/2)…")
+            ydl_opts_mp3 = {
+                "format": "bestaudio/best",
+                "outtmpl": str(AUDIOS_DIR / "%(title)s.%(ext)s"),
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }
+                ],
+                "progress_hooks": [hook],
+                "quiet": True,
+                "no_warnings": True,
+            }
+            try:
                 with yt_dlp.YoutubeDL(ydl_opts_mp3) as ydl:
-                    ydl.extract_info(self._url, download=True)
-                self.progress.emit(100)
+                    ydl.download([self._url])
+            except Exception:  # noqa: BLE001
+                self.status.emit("FFmpeg introuvable : MP3 non généré.")
+                audio_path = None
 
         except Exception as exc:  # noqa: BLE001
             success = False
             error_message = f"Erreur : {exc}"
             self.status.emit(error_message)
-
-        if success:
+        else:
             self.status.emit("Terminé")
-        self.finished.emit(success, None, error_message)
+
+        self.finished.emit(success, video_path, audio_path, error_message)
 
 
 class YouTubeTab(QWidget):
@@ -178,6 +216,8 @@ class YouTubeTab(QWidget):
         self.selected_itag: Optional[str] = None
         self.current_url: str = ""
         self.formats_data: List[Dict[str, Any]] = []
+        self.current_info: Dict[str, Any] = {}
+        self._selected_row: Optional[int] = None
         self.probe_worker: Optional[YTDLPProbeWorker] = None
         self.download_worker: Optional[YTDLPDownloadWorker] = None
         self._setup_ui()
@@ -193,26 +233,20 @@ class YouTubeTab(QWidget):
         input_layout.addWidget(self.url_input)
         input_layout.addWidget(self.analyze_button)
 
-        self.table = QTableWidget(0, 9)
-        self.table.setHorizontalHeaderLabels([
-            "✓",
-            "itag",
-            "ext",
-            "résolution",
-            "fps",
-            "vcodec",
-            "acodec",
-            "taille",
-            "note",
-        ])
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.cellDoubleClicked.connect(self._on_row_double_clicked)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.verticalHeader().setVisible(False)
+        self.duration_label = QLabel("Durée : ?")
 
-        self.status_label = QLabel("Prêt.")
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["✓", "itag", "resolution", "taille"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.cellDoubleClicked.connect(self._on_row_double_clicked)
+        self.table.setSortingEnabled(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+
+        self.status_lbl = QLabel("Prêt.")
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -222,31 +256,20 @@ class YouTubeTab(QWidget):
             "QProgressBar::chunk{ background:#28a745; }"
         )
 
-        options_layout = QHBoxLayout()
-        self.download_video_checkbox = QCheckBox("MP4 (vidéo)")
-        self.download_video_checkbox.setChecked(True)
-        self.download_audio_checkbox = QCheckBox("MP3 (audio)")
-        self.download_audio_checkbox.setChecked(True)
-        self.download_video_checkbox.stateChanged.connect(self._update_download_button_state)
-        self.download_audio_checkbox.stateChanged.connect(self._update_download_button_state)
-        options_layout.addWidget(self.download_video_checkbox)
-        options_layout.addWidget(self.download_audio_checkbox)
-        options_layout.addStretch()
-
         self.download_button = QPushButton("Télécharger")
         self.download_button.setEnabled(False)
         self.download_button.clicked.connect(self._on_download_clicked)
 
         layout.addLayout(input_layout)
+        layout.addWidget(self.duration_label)
         layout.addWidget(self.table)
-        layout.addWidget(self.status_label)
+        layout.addWidget(self.status_lbl)
         layout.addWidget(self.progress)
-        layout.addLayout(options_layout)
         layout.addWidget(self.download_button)
 
     def append_log(self, message: str) -> None:
         """Met à jour le label de statut."""
-        self.status_label.setText(message)
+        self.status_lbl.setText(message)
 
     def _on_analyze_clicked(self) -> None:
         url = self.url_input.text().strip()
@@ -259,12 +282,14 @@ class YouTubeTab(QWidget):
         self.download_button.setEnabled(False)
         self.table.setRowCount(0)
         self.formats_data.clear()
+        self.current_info = {}
         self.current_url = url
         self.progress.setValue(0)
+        self.duration_label.setText("Durée : ?")
         self.probe_worker = YTDLPProbeWorker(url)
         self.probe_worker.log.connect(self.append_log)
         self.probe_worker.error.connect(self.append_log)
-        self.probe_worker.formats_ready.connect(self._populate_formats)
+        self.probe_worker.info_ready.connect(self._populate_formats)
         self.probe_worker.finished.connect(self._on_probe_finished)
         self.probe_worker.start()
 
@@ -272,81 +297,119 @@ class YouTubeTab(QWidget):
         self.analyze_button.setEnabled(True)
         self.probe_worker = None
 
-    def _populate_formats(self, formats: List[Dict[str, Any]]) -> None:
+    def _populate_formats(self, info: Dict[str, Any]) -> None:
+        self.current_info = info
+        duration = info.get("duration")
+        self.duration_label.setText(_fmt_duration(duration if isinstance(duration, (int, float)) else None))
+        formats = info.get("formats", []) or []
         rows = [
-            f
-            for f in formats
-            if f.get("ext") == "mp4"
-            and not str(f.get("format_id", "")).startswith("sb")
-            and f.get("ext") != "mhtml"
-            and f.get("vcodec") not in (None, "none")
-            and f.get("acodec") not in (None, "none")
+            fmt
+            for fmt in formats
+            if fmt.get("ext") == "mp4"
+            and not str(fmt.get("format_id", "")).startswith("sb")
+            and fmt.get("ext") != "mhtml"
+            and fmt.get("vcodec") not in (None, "none")
+            and fmt.get("acodec") not in (None, "none")
         ]
+
         self.formats_data = rows
-        self.table.setRowCount(len(rows))
-        for row, data in enumerate(rows):
-            fields = {
-                "itag": str(data.get("format_id", "")),
-                "ext": data.get("ext", ""),
-                "résolution": f"{data.get('width', '')}x{data.get('height', '')}" if data.get("width") and data.get("height") else data.get("resolution", ""),
-                "fps": str(data.get("fps", "")),
-                "vcodec": data.get("vcodec", ""),
-                "acodec": data.get("acodec", ""),
-                "taille": format_filesize(data.get("filesize") or data.get("filesize_approx")),
-                "note": data.get("format_note", ""),
-            }
-            check_item = QTableWidgetItem()
-            check_item.setData(Qt.ItemDataRole.DecorationRole, QIcon())
+        sorting_enabled = self.table.isSortingEnabled()
+        if sorting_enabled:
+            self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+
+        for fmt in rows:
+            itag = str(fmt.get("format_id", ""))
+            width, height = fmt.get("width"), fmt.get("height")
+            if width and height:
+                resolution = f"{width}x{height}"
+            elif height:
+                resolution = f"{height}p"
+            else:
+                resolution = "?"
+            nbytes, approx = _estimate_size_bytes(fmt, float(duration) if duration else None)
+            human_size = _human_mb(nbytes, approx)
+
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            check_item = QTableWidgetItem("")
             check_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             self.table.setItem(row, 0, check_item)
-            for col, key in enumerate(["itag", "ext", "résolution", "fps", "vcodec", "acodec", "taille", "note"], start=1):
-                item = QTableWidgetItem(fields[key])
+
+            item_itag = QTableWidgetItem(itag)
+            item_res = QTableWidgetItem(resolution)
+            item_size = QTableWidgetItem(human_size)
+
+            height_value = int(height) if height else 0
+            item_res.setData(Qt.ItemDataRole.UserRole, height_value)
+            item_size.setData(Qt.ItemDataRole.UserRole, nbytes or 0)
+
+            for column, item in enumerate([item_itag, item_res, item_size], start=1):
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                self.table.setItem(row, col, item)
+                self.table.setItem(row, column, item)
+
         self.table.resizeColumnsToContents()
         if self.table.columnCount() > 0:
             self.table.setColumnWidth(0, 30)
+
         if rows:
             self.append_log("Double-cliquez sur un format pour le sélectionner.")
+            self._auto_pick_row()
         else:
             self.append_log("Aucun format MP4 progressif trouvé.")
+        if sorting_enabled:
+            self.table.setSortingEnabled(True)
 
     def _on_row_double_clicked(self, row: int, column: int) -> None:  # noqa: ARG002
+        self._select_row(row)
+
+    def _select_row(self, row: int) -> None:
         if row < 0 or row >= len(self.formats_data):
             return
-        format_id = self.formats_data[row].get("format_id")
+        fmt = self.formats_data[row]
+        format_id = fmt.get("format_id")
         if not format_id:
             self.append_log("Format invalide sélectionné.")
             return
         self.table.selectRow(row)
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item:
+                item.setText("✓" if r == row else "")
         self.selected_itag = str(format_id)
-        self._update_checkmarks(row)
+        self._selected_row = row
         self.append_log(f"Format sélectionné : itag {self.selected_itag}.")
         self._update_download_button_state()
 
-    def _update_checkmarks(self, selected_row: int) -> None:
-        check_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
+    def _auto_pick_row(self) -> None:
+        best_row: Optional[int] = None
+        best_height = 0
         for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
-            if not item:
-                continue
-            if row == selected_row:
-                item.setData(Qt.ItemDataRole.DecorationRole, check_icon)
-            else:
-                item.setData(Qt.ItemDataRole.DecorationRole, QIcon())
+            item = self.table.item(row, 2)
+            height = item.data(Qt.ItemDataRole.UserRole) if item else 0
+            height = int(height) if height else 0
+            if height == 720:
+                best_row = row
+                break
+            if height > best_height:
+                best_height = height
+                best_row = row
+        if best_row is not None:
+            self._select_row(best_row)
 
     def _reset_selection(self) -> None:
         self.selected_itag = None
+        self._selected_row = None
         self.table.clearSelection()
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
             if item:
-                item.setData(Qt.ItemDataRole.DecorationRole, QIcon())
+                item.setText("")
         self._update_download_button_state()
 
     def _update_download_button_state(self) -> None:
-        any_download = self.download_video_checkbox.isChecked() or self.download_audio_checkbox.isChecked()
-        self.download_button.setEnabled(bool(self.selected_itag) and any_download and not self._is_download_running())
+        self.download_button.setEnabled(bool(self.selected_itag) and not self._is_download_running())
 
     def _is_download_running(self) -> bool:
         return self.download_worker is not None and self.download_worker.isRunning()
@@ -355,22 +418,15 @@ class YouTubeTab(QWidget):
         if not self.current_url or not self.selected_itag:
             self.append_log("Sélectionnez un format avant de télécharger.")
             return
-        if not (self.download_video_checkbox.isChecked() or self.download_audio_checkbox.isChecked()):
-            self.append_log("Sélectionnez au moins un type de téléchargement.")
-            return
         if self._is_download_running():
             self.append_log("Téléchargement déjà en cours.")
             return
-        download_dir = ensure_download_dir(Path("./downloads"))
         self.download_button.setEnabled(False)
         self.append_log("Préparation du téléchargement…")
         self.progress.setValue(0)
         self.download_worker = YTDLPDownloadWorker(
             self.current_url,
             self.selected_itag,
-            download_dir,
-            self.download_video_checkbox.isChecked(),
-            self.download_audio_checkbox.isChecked(),
         )
         self.download_worker.progress.connect(self._on_download_progress)
         self.download_worker.status.connect(self.append_log)
@@ -380,14 +436,26 @@ class YouTubeTab(QWidget):
     def _on_download_progress(self, percent: int) -> None:
         self.progress.setValue(percent)
 
-    def _on_download_finished(self, success: bool, path: Optional[str], error: Optional[str]) -> None:
+    def _on_download_finished(
+        self,
+        success: bool,
+        video_path: Optional[str],
+        audio_path: Optional[str],  # noqa: ARG002
+        error: Optional[str],
+    ) -> None:
         if not success:
             if error:
                 self.append_log(error)
             else:
                 self.append_log("Téléchargement échoué.")
+        if success and video_path and self._selected_row is not None:
+            text, size_bytes = _human_mb_exact(Path(video_path))
+            item = self.table.item(self._selected_row, 3)
+            if item:
+                item.setText(text)
+                if size_bytes is not None:
+                    item.setData(Qt.ItemDataRole.UserRole, size_bytes)
         self.progress.setValue(100 if success else self.progress.value())
-        self.download_button.setEnabled(False)
         self.download_worker = None
         self._update_download_button_state()
 
